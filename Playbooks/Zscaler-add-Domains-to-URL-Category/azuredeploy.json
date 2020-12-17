@@ -48,7 +48,8 @@
         }
     },
     "variables": {
-        "azuresentinel": "[concat('azuresentinel-', parameters('PlaybookName'))]"
+        "azuresentinel": "[concat('azuresentinel-', parameters('PlaybookName'))]",
+		"IntegrationAccountName":"[concat(toLower(parameters('IntegrationAccountName')), uniqueString(resourceGroup().id))]"
     },
     "resources": [
         {
@@ -67,7 +68,7 @@
                     {
                         "type": "Microsoft.Logic/integrationAccounts",
                         "apiVersion": "2016-06-01",
-                        "name": "[parameters('IntegrationAccountName')]",
+                        "name": "[variables('IntegrationAccountName')]",
                         "location": "[resourceGroup().location]",
                         "sku": {
                             "name": "[parameters('IntegrationAccountPricingTier')]"
@@ -110,7 +111,7 @@
                             "properties": {
                                 "state": "Enabled",
                                 "integrationAccount": {
-                                    "id": "[resourceId(subscription().subscriptionId, resourceGroup().name, 'Microsoft.Logic/integrationAccounts', parameters('IntegrationAccountName'))]"
+                                    "id": "[resourceId(subscription().subscriptionId, resourceGroup().name, 'Microsoft.Logic/integrationAccounts', variables('IntegrationAccountName'))]"
                                 },
                                 "definition": {
                                     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
