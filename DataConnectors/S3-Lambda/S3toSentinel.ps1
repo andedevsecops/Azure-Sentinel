@@ -18,6 +18,28 @@
 # Uncomment to send the input event to CloudWatch Logs
 # Write-Host (ConvertTo-Json -InputObject $LambdaInput -Compress -Depth 5)
 
+Function Expand-GZipFile {
+    Param(
+        $infile,
+        $outfile       
+    )
+	Write-Host "Processing Expand-GZipFile for: infile = $infile, outfile = $outfile"
+    $inputfile = New-Object System.IO.FileStream $infile, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), ([IO.FileShare]::Read)	
+    $output = New-Object System.IO.FileStream $outfile, ([IO.FileMode]::Create), ([IO.FileAccess]::Write), ([IO.FileShare]::None)	
+    $gzipStream = New-Object System.IO.Compression.GzipStream $inputfile, ([IO.Compression.CompressionMode]::Decompress)	
+	
+    $buffer = New-Object byte[](1024)	
+    while ($true) {
+        $read = $gzipstream.Read($buffer, 0, 1024)		
+        if ($read -le 0) { break }		
+		$output.Write($buffer, 0, $read)		
+	}
+	
+    $gzipStream.Close()
+    $output.Close()
+    $inputfile.Close()
+}
+
 foreach ($record in $LambdaInput.Records) {
     #Credit to Travis Roberts for the function from https://github.com/tsrob50/LogAnalyticsAPIFunction/blob/master/Write-OMSLogfile.ps1
     function Write-OMSLogfile {
@@ -145,105 +167,118 @@ foreach ($record in $LambdaInput.Records) {
         return $returnCode
     }
     
-    $bucket = $record.s3.bucket.name
-    $key = $record.s3.object.key
+    $s3BucketName = $record.s3.bucket.name
+    $s3BucketKey = $record.s3.object.key
 
-    $workspaceId = "workspaceId"
-    $workspaceKey = "workspaceKey"
-    $CustomLogName = "CustomLog"
-    #$worksapceId = $env:workspaceId
-    #$workspaceKey = $env:workspaceKey
-    #$CustomLogName = $env:CustomLogName
+    $worksapceId = $env:workspaceId
+    $workspaceKey = $env:workspaceKey
+    $CustomLogName = $env:CustomLogName
 
 
     Write-Host "Processing event for: bucket = $bucket, key = $key"
+	
+	IF ($Null -ne $s3BucketName -and $Null -ne $s3BucketKey) {
+		$s3KeyPath = $s3BucketKey -Replace ('%3A', ':')			
+		$fileNameSplit = $s3KeyPath.split('/')			
+		$fileSplits = $fileNameSplit.Length - 1			
+		$fileName = $filenameSplit[$fileSplits].replace(':', '_')			
+		$downloadedFile = Read-S3Object -BucketName $s3BucketName -Key $s3BucketKey -File "/tmp/$filename"			
+		Write-Host "Object $s3BucketKey is $($downloadedFile.Size) bytes; Extension is $($downloadedFile.Extension)"
+		
+		IF ($downloadedFile.Extension -eq '.gz' ) {
+			$infile = "/tmp/$filename"				
+			$outfile = "/tmp/" + $filename -replace ($downloadedFile.Extension, '')					
+			Expand-GZipFile $infile.Trim() $outfile.Trim()
+			$null = Remove-Item -Path $infile -Force -Recurse -ErrorAction Ignore
+			$filename = $filename -replace ($downloadedFile.Extension, '')
+			$filename = $filename.Trim()		
 
-    # TODO: Add logic to handle S3 event record, for example
-    $obj = Get-S3Object -Bucket $bucket -Key $key
-    Write-Host "Object $key is $($obj.Size) bytes"
+			$logEvents = Get-Content -Raw -LiteralPath ("/tmp/$filename" ) 
+			$logEvents = $logEvents.Substring(0, ($logEvents.length) - 1)
+			$logEvents = $logEvents -Replace ('{"Records":', '')
+			$loglength = $logEvents.Length			
+			$data = $logEvents			
+		}
+		ELSEIF ($downloadedFile.Extension -eq '.csv'){
+			Write-Host "Handling CSV File"			
+			$data = import-csv "/tmp/$filename"
+		}
+		ELSEIF ($downloadedFile.Extension -eq '.json'){
+			Write-Host "Handling JSON File"
+			$data = Get-Content -Raw -LiteralPath ("/tmp/$filename") | ConvertFrom-Json			
+		}
+		elseif ($downloadedFile.Extension -like "*.log") {
+			Write-Host "Handling Log File"
+			#Assuming CEF formatted logs
+			$cefdata = Get-Content -Raw -LiteralPath ("/tmp/$filename")
+			$data = @()
+			$cefmsg = @{}
+			foreach ($line in $cefdata) {
+				if ($line -like "*CEF:*") {
+					#Write-Host "Handling CEF Data"
+					$CEFtimegenerated = ($line -split '(?<time>(?:\w+ +){2,3}(?:\d+:){2}\d+|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.[\w\-\:\+]{3,12})')[1]
+					#$CEFHost = (($line -split '(?<time>(?:\w+ +){2,3}(?:\d+:){2}\d+|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.[\w\-\:\+]{3,12})')[2] -split "CEF:")[0]
+					#$CEFVersion = $line.Split("CEF: ").Split("|")[1]
+					$CEFDeviceVendor = $line.split("|")[1]
+					$CEFDeviceProduct = $line.split("|")[2]
+					$CEFDeviceVersion = $line.split("|")[3]
+					$CEFDeviceEventClassId = $line.split("|")[4]
+					$CEFName = $line.split("|")[5]
+					$CEFSeverity = $line.split("|")[6]
+					$CEFExtension = $line.split("|")[7] -split '([^=\s]+=(?:[\\]=|[^=])+)(?:\s|$)'
+					foreach ($extenstion in $CEFExtension) {
+						if ($extenstion -like "*=*") { $cefmsg += @{$extenstion.Split("=")[0] = $extenstion.Split("=")[1] } }
+					}      
+					$CEFmsg += @{TimeGenerated = $CEFtimegenerated }
+					$CEFmsg += @{DeviceVendor = $CEFDeviceVendor }
+					$CEFmsg += @{DeviceProduct = $CEFDeviceProduct }
+					$CEFmsg += @{DeviceVersion = $CEFDeviceVersion }
+					$CEFmsg += @{DeviceEventClassID = $CEFDeviceEventClassId }
+					$CEFmsg += @{Activity = $CEFName }
+					$CEFmsg += @{LogSeverity = $CEFSeverity }
+					$data += $CEFmsg
+					$cefmsg = @{}
+				}
+			}
+			Write-Host "Finished Handling Log file"
+		}
+		else { 
+			Write-Host "$filename is not supported yet" 
+		}
+		
+		Write-Host "Number of data records: " ($data.Count)
+		#Parsing Function to drop or add or edit fields
+		#FUTURE
+		
+		#Test Size; Log A limit is 30MB
+		$tempdata = @()
+		$tempDataSize = 0
+		Write-Host "Checking if upload is over 25MB"
+		if ((($Data |  Convertto-json -depth 20).Length) -gt 25MB) {
+			Write-Host "Upload needs to be split"
+			foreach ($record in $data) {
+				$tempdata += $record
+				$tempDataSize += ($record | ConvertTo-Json -depth 20).Length
+				if ($tempDataSize -gt 25MB) {
+					Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $tempdata -CustomerID $workspaceId -SharedKey $workspaceKey
+					write-Host "Sending data = $TempDataSize"
+					$tempdata = $null
+					$tempdata = @()
+					$tempDataSize = 0
+				}
+			}
+			Write-Host "Sending left over data = $Tempdatasize"
+			Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $tempdata -CustomerID $workspaceId -SharedKey $workspaceKey
+		}
+		Else {
+			#Send to Log A as is
+			Write-Host "Upload does not need to be split, sending to Log A"
+			Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $Data -CustomerID $workspaceId -SharedKey $workspaceKey
+		}
 
-    #Download the file
-    Write-Host "Downloading $key to /tmp/$key"
-    Read-S3Object -BucketName $bucket -Key $key -File "/tmp/$key"
-    Write-Host "Downloaded $key to /tmp/$key"
+		Remove-Item $FileName -Force
+	}    
 
-    #Determine if CSV or JSON or whatever
-    $FileName = "/tmp/$key"
-    if ($fileName -like "*.csv") {
-        Write-Host "Handling CSV File"
-        $data = import-csv $filename
-    }
-    elseif ($filename -like "*.json") {
-        Write-Host "Handling JSON File"
-        $Data = Get-Content $filename | ConvertFrom-Json
-    }
-    elseif ($filename -like "*.log") {
-        Write-Host "Handling Log File"
-        #Assuming CEF formatted logs
-        $cefdata = Get-Content $filename
-        $data = @()
-        $cefmsg = @{}
-        foreach ($line in $cefdata) {
-            if ($line -like "*CEF:*") {
-                #Write-Host "Handling CEF Data"
-                $CEFtimegenerated = ($line -split '(?<time>(?:\w+ +){2,3}(?:\d+:){2}\d+|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.[\w\-\:\+]{3,12})')[1]
-                #$CEFHost = (($line -split '(?<time>(?:\w+ +){2,3}(?:\d+:){2}\d+|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.[\w\-\:\+]{3,12})')[2] -split "CEF:")[0]
-                #$CEFVersion = $line.Split("CEF: ").Split("|")[1]
-                $CEFDeviceVendor = $line.split("|")[1]
-                $CEFDeviceProduct = $line.split("|")[2]
-                $CEFDeviceVersion = $line.split("|")[3]
-                $CEFDeviceEventClassId = $line.split("|")[4]
-                $CEFName = $line.split("|")[5]
-                $CEFSeverity = $line.split("|")[6]
-                $CEFExtension = $line.split("|")[7] -split '([^=\s]+=(?:[\\]=|[^=])+)(?:\s|$)'
-                foreach ($extenstion in $CEFExtension) {
-                    if ($extenstion -like "*=*") { $cefmsg += @{$extenstion.Split("=")[0] = $extenstion.Split("=")[1] } }
-                }      
-                $CEFmsg += @{TimeGenerated = $CEFtimegenerated }
-                $CEFmsg += @{DeviceVendor = $CEFDeviceVendor }
-                $CEFmsg += @{DeviceProduct = $CEFDeviceProduct }
-                $CEFmsg += @{DeviceVersion = $CEFDeviceVersion }
-                $CEFmsg += @{DeviceEventClassID = $CEFDeviceEventClassId }
-                $CEFmsg += @{Activity = $CEFName }
-                $CEFmsg += @{LogSeverity = $CEFSeverity }
-                $data += $CEFmsg
-                $cefmsg = @{}
-            }
-        }
-        Write-Host "Finished Handling Log file"
-    }
-    else { Write-Host "$filename is not supported yet" }
-
-    Write-Host "Number of data records: " ($Data.Count)
-    #Parsing Function to drop or add or edit fields
-    #FUTURE
-
-    #Test Size; Log A limit is 30MB
-    $tempdata = @()
-    $tempDataSize = 0
-    Write-Host "Checking if upload is over 25MB"
-    if ((($Data |  Convertto-json -depth 20).Length) -gt 25MB) {
-        Write-Host "Upload needs to be split"
-        foreach ($record in $data) {
-            $tempdata += $record
-            $tempDataSize += ($record | ConvertTo-Json -depth 20).Length
-            if ($tempDataSize -gt 25MB) {
-                Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $tempdata -CustomerID $workspaceId -SharedKey $workspaceKey
-                write-Host "Sending data = $TempDataSize"
-                $tempdata = $null
-                $tempdata = @()
-                $tempDataSize = 0
-            }
-        }
-        Write-Host "Sending left over data = $Tempdatasize"
-        Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $tempdata -CustomerID $workspaceId -SharedKey $workspaceKey
-    }
-    Else {
-        #Send to Log A as is
-        Write-Host "Upload does not need to be split, sending to Log A"
-        Write-OMSLogfile -dateTime (Get-Date) -type $CustomLogName -logdata $Data -CustomerID $workspaceId -SharedKey $workspaceKey
-    }
-
-    Remove-Item $FileName -Force
+    Write-Host "Number of data records: " ($Data.Count) 
 }
 
